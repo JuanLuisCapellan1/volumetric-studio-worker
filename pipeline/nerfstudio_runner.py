@@ -1,9 +1,12 @@
+# pipeline/nerfstudio_runner.py -- archivo completo revisado
+import json
 import os
 import subprocess
 
 NERFSTUDIO_IMAGE = os.environ.get("NERFSTUDIO_IMAGE", "ghcr.io/nerfstudio-project/nerfstudio:latest")
 MAX_TRAIN_ITERATIONS = os.environ.get("MAX_TRAIN_ITERATIONS", "15000")
-MIN_REGISTERED_FRAMES = 20
+MIN_REGISTERED_FRAMES = int(os.environ.get("MIN_REGISTERED_FRAMES", "20"))
+
 
 def _run_docker_command(work_dir: str, args: list[str], timeout_seconds: int) -> None:
     volume_mount = f"{work_dir}:/workspace/"
@@ -19,12 +22,11 @@ def _run_docker_command(work_dir: str, args: list[str], timeout_seconds: int) ->
         docker_args,
         capture_output=True,
         text=True,
-        encoding="utf-8",   # ← fuerza UTF-8 en vez de cp1252 (default en Windows)
-        errors="replace",   # ← sustituye caracteres no decodificables en vez de fallar
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout_seconds,
     )
 
-    # Blindaje extra: nunca asumir que stdout/stderr no son None
     stdout_text = result.stdout or ""
     stderr_text = result.stderr or ""
 
@@ -38,20 +40,27 @@ def _run_docker_command(work_dir: str, args: list[str], timeout_seconds: int) ->
             f"STDERR (final): {stderr_text[-2000:]}"
         )
 
+
 def process_camera_poses(work_dir: str) -> None:
-    """
-    Ejecuta ns-process-data sobre el video fuente. Esto REEMPLAZA nuestra
-    extracción de frames con ffmpeg: nerfstudio hace su propia selección de
-    frames (evitando borrosos/duplicados) y corre COLMAP internamente para
-    resolver la posición de cada cámara (Structure-from-Motion).
-    """
     _run_docker_command(
         work_dir,
-        ["ns-process-data", "video", "--data", "/workspace/source_video.mp4", "--output-dir", "/workspace/processed"],
+        [
+            "ns-process-data", "video",
+            "--data", "/workspace/source_video.mp4",
+            "--output-dir", "/workspace/processed",
+            "--matching-method", "exhaustive",  # compara TODOS los pares, no solo consecutivos
+            "--num-frames-target", "200",       # más redundancia entre frames que "evenly spaced" por defecto
+        ],
         timeout_seconds=900,
     )
 
+
 def validate_camera_poses(work_dir: str) -> None:
+    """
+    Falla RÁPIDO y con mensaje claro si COLMAP no registró suficientes
+    cámaras -- evita gastar 10-30 min de GPU entrenando sobre un dataset
+    inservible.
+    """
     transforms_path = os.path.join(work_dir, "processed", "transforms.json")
 
     if not os.path.exists(transforms_path):
@@ -63,19 +72,16 @@ def validate_camera_poses(work_dir: str) -> None:
     frame_count = len(data.get("frames", []))
     if frame_count < MIN_REGISTERED_FRAMES:
         raise RuntimeError(
-            f"COLMAP solo pudo registrar {frame_count} imágenes de cámara -- "
-            f"insuficiente para entrenar (mínimo recomendado: {MIN_REGISTERED_FRAMES}). "
-            "Esto suele deberse a poca cobertura de la escena, movimiento demasiado "
-            "rápido, poca superposición entre frames, o iluminación inconsistente."
+            f"COLMAP solo registró {frame_count} imágenes de cámara -- "
+            f"insuficiente para entrenar (mínimo: {MIN_REGISTERED_FRAMES}). "
+            "Causas típicas: movimiento de cámara demasiado rápido, poca "
+            "superposición entre frames, superficies sin textura, o video borroso."
         )
 
+    print(f"Validación OK: COLMAP registró {frame_count} cámaras.")
+
+
 def train_splat_model(work_dir: str) -> str:
-    """
-    Entrena con Splatfacto (implementación de 3D Gaussian Splatting de
-    nerfstudio). --max-num-iterations en 15000 es un punto de partida
-    conservador para 8GB VRAM (RTX 3070) -- ajusta según tiempo/calidad
-    que necesites.
-    """
     _run_docker_command(
         work_dir,
         [
@@ -93,7 +99,6 @@ def train_splat_model(work_dir: str) -> str:
 
 
 def export_splat_file(work_dir: str, config_path_in_container: str) -> str:
-    """Exporta el modelo entrenado a un .ply consumible por el visor web."""
     _run_docker_command(
         work_dir,
         ["ns-export", "gaussian-splat", "--load-config", config_path_in_container, "--output-dir", "/workspace/export"],
@@ -122,6 +127,4 @@ def _find_latest_config(work_dir: str) -> str:
     if not os.path.exists(host_config_path):
         raise FileNotFoundError(f"No se encontró config.yml en {host_config_path}")
 
-    # Devolvemos la ruta EN EL CONTENEDOR (/workspace/...), que es lo que
-    # ns-export necesita recibir en --load-config
     return f"/workspace/output/processed/splatfacto/{latest}/config.yml"
